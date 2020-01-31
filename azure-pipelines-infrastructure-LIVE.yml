@@ -1,0 +1,157 @@
+name: $(Major).$(Minor).$(Patch)
+
+variables:
+- group: TerraformGlobalValues
+- name: Major
+  value: 1
+- name: Minor
+  value: 0
+- name: Patch
+  value: $[counter(format('{0}.{1}', variables['Major'], variables['Minor']), 0)]
+- name: ClientName
+  value: CLIENT # 6 Characters Maximum
+- name: SupplierName
+  value: Supplier
+- name: Environment
+  value: LIVE
+
+resources:
+- repo: self
+
+trigger:  
+  branches:
+    include:
+    - master
+  paths:
+    include:
+    - Azure/*
+    - azure-pipelines-infrastructure-LIVE.yml
+
+stages:
+- stage: Build
+  displayName: Build
+  jobs:
+  - job: Build
+    displayName: Build Infrastructure as Code
+    pool:
+      name: LocalTest
+    workspace:
+      clean: all 
+    steps:
+    - task: TerraformInstaller@0
+      displayName: 'Install Terraform 0.12.18'
+      inputs:
+        terraformVersion: 0.12.18
+
+    - task: replacetokens@3
+      displayName: 'Replace secret tokens in terraform files'
+      inputs:
+        rootDirectory: Azure/env/Live
+        actionOnMissing: 'fail'
+        targetFiles: |
+          *.tfvars
+          *.tf
+      env:
+        backend_state_resource_group_name: $(backend_state_resource_group_name)
+        backend_state_storage_account_name: $(backend_state_storage_account_name)
+        backend_state_container_name: $(backend_state_container_name)
+        backend_state_key: $(backend_state_key)
+        subscription_id: $(subscription_id)
+        client_id: $(client_id)
+        client_secret: $(client_secret)
+        tenant_id: $(tenant_id)
+        SupplierName: $(SupplierName)
+        ClientName: $(ClientName)
+        Public_RDP_Allowed_IP_Addresses: $(Public_RDP_Allowed_IP_Addresses) #{Public_RDP_Allowed_IP_Addresses}# # Example ["1.1.1.1","2.2.2.2"]     
+
+    - task: TerraformTaskV1@0
+      displayName: 'Terraform : Init'
+      inputs:
+        workingDirectory: Azure/env/Live
+        backendServiceArm: '#Azure DevOps Service Connection to Azure Sub#'
+        backendAzureRmResourceGroupName: DevOps
+        backendAzureRmStorageAccountName: devops
+        backendAzureRmContainerName: 'terraform-state'
+        backendAzureRmKey: tf/$(ClientName)/$(Environment)/terraform.tfstate
+
+    - task: TerraformTaskV1@0
+      displayName: 'Terraform : Validate'
+      inputs:
+        command: validate
+        workingDirectory: Azure/env/Live
+        commandOptions: '-var-file=".\live.tfvars"`'
+        backendServiceArm: '#Azure DevOps Service Connection to Azure Sub#'
+        backendAzureRmResourceGroupName: DevOps
+        backendAzureRmStorageAccountName: devops
+        backendAzureRmContainerName: 'terraform-state'
+        backendAzureRmKey: tf/$(ClientName)/$(Environment)/terraform.tfstate
+
+    - powershell: |
+       Remove-Item $(Build.SourcesDirectory)\Azure\env\Live\.terraform -Recurse -Force 
+       Copy-Item $(Build.SourcesDirectory)\* $(Build.ArtifactStagingDirectory)\ -Recurse
+      displayName: 'Copy Terraform Config Files to Artifacts Directory'
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)\'
+        artifact: TerraformPackage
+
+- stage: Deploy
+  dependsOn: Build
+  jobs: 
+  - deployment: Deploy
+    displayName: Deploy Infrastructure as Code
+    pool:
+      name: LocalTest
+    environment: Live
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: TerraformInstaller@0
+            displayName: 'Install Terraform 0.12.18'
+            inputs:
+              terraformVersion: 0.12.18
+
+          - task: TerraformTaskV1@0
+            displayName: 'Terraform : Init'
+            inputs:
+              workingDirectory: $(Pipeline.Workspace)\TerraformPackage\Azure\env\Live
+              backendServiceArm: '#Azure DevOps Service Connection to Azure Sub#'
+              backendAzureRmResourceGroupName: DevOps
+              backendAzureRmStorageAccountName: devops
+              backendAzureRmContainerName: 'terraform-state'
+              backendAzureRmKey: tf/$(ClientName)/$(Environment)/terraform.tfstate
+
+          - task: replacetokens@3
+            displayName: 'Replace secret tokens in **/*.ps1'
+            inputs:
+              rootDirectory: $(Pipeline.Workspace)\TerraformPackage\Azure\modules\files
+              targetFiles: '**/*.ps1'
+            env:
+              AD_User_Password: $(AD_User_Password) # Maps the secret variable $(token)
+              AD_Support_User_Password: $(AD_Support_User_Password) 
+              AD_SqlServerAgentService_Password: $(AD_SqlServerAgentService_Password) 
+              AD_SqlServerService_Password: $(AD_SqlServerService_Password) 
+              AD_Svc_Api_LIVE_Password: $(AD_Svc_Api_LIVE_Password) 
+              AD_Svc_Api_UAT_Password: $(AD_Svc_Api_UAT_Password) 
+              AD_Svc_Api_PREPROD_Password: $(AD_Svc_Api_PREPROD_Password) 
+              AD_Svc_Api_STAGING_Password: $(AD_Svc_Api_STAGING_Password)
+              SupplierName: $(SupplierName)
+
+          - task: TerraformTaskV1@0
+            displayName: 'Terraform : Plan'
+            inputs:
+              command: plan
+              workingDirectory: $(Pipeline.Workspace)\TerraformPackage\Azure\env\Live
+              commandOptions: '-lock=false -var-file=".\live.tfvars"'
+              environmentServiceNameAzureRM: '#Azure DevOps Service Connection to Azure Sub#'
+           
+          - task: TerraformTaskV1@0
+            displayName: 'Terraform : Apply'
+            inputs:
+              command: apply
+              workingDirectory: $(Pipeline.Workspace)\TerraformPackage\Azure\env\Live
+              commandOptions: '-lock=false -var-file=".\live.tfvars" -auto-approve'
+              environmentServiceNameAzureRM: '#Azure DevOps Service Connection to Azure Sub#'
+           

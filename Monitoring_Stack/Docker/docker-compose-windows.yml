@@ -1,0 +1,55 @@
+version: '2'
+
+services:
+  influxdb:
+    image: influxdb:latest
+    container_name: influxdb
+    ports:
+      - "8086:8086"
+      - "8083:8083"
+      - "25826:25826/udp"
+    volumes:
+      - c:/docker/influxdb:/var/lib/influxdb
+      - c:/docker/influxdb/influxdbtypes/types.db:/usr/share/collectd/types.db:ro
+    environment:
+    - INFLUXDB_COLLECTD_ENABLED=true
+    - INFLUXDB_COLLECTD_BIND_ADDRESS=:25826
+    - INFLUXDB_COLLECTD_DATABASE=collectd
+    - INFLUXDB_COLLECTD_BATCH_SIZE=5000
+    - INFLUXDB_COLLECTD_BATCH_PENDING=10
+    - INFLUXDB_COLLECTD_BATCH_TIMEOUT=10s
+    - INFLUXDB_COLLECTD_READ_BUFFER=0
+    - INFLUXDB_COLLECTD_TYPESDB=/usr/share/collectd/types.db
+    restart: always
+    labels:
+      container_group: monitoring
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - c:/docker/grafana:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+      - GF_SERVER_ROOT_URL=https://localhost:3000/grafana
+    depends_on:
+      - influxdb
+    restart: always
+    labels:
+      container_group: monitoring
+  portainer:
+    container_name: portainer
+    restart: always
+    image: portainer/portainer
+    volumes:
+      - c:/docker/portainer:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - influxdb
+      - grafana
+    ports:
+      - "9000:9000"
+    labels:
+      container_group: monitoring

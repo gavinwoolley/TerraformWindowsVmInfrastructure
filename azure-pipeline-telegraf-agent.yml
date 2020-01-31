@@ -1,0 +1,177 @@
+name: $(Major).$(Minor).$(Patch)
+
+variables:
+  Major: 1
+  Minor: 0
+  Patch: $[counter(format('{0}.{1}', variables['Major'], variables['Minor']), 0)]
+  GRAFANA_BASE_URL: http://192.168.17.95/grafana
+  
+resources:
+- repo: self
+
+trigger:  
+  branches:
+    include:
+    - master
+  paths:
+    include:
+    - Monitoring_Stack/Telegraf/*
+    - azure-pipeline-telegraf-agent.yml
+
+stages:
+- stage: Build
+  displayName: Build
+  jobs:
+  - job: Build
+    displayName: Build Telegraf Monitoring Solution
+    pool:
+      name: LocalTest
+    workspace:
+      clean: all 
+    steps:
+    - powershell: | 
+       Write-Host "Downloading Telegraf Binary"
+       New-Item -Path "$(Agent.TempDirectory)\telegraf" -ItemType Directory -Force
+       Invoke-WebRequest "https://dl.influxdata.com/telegraf/releases/telegraf-1.13.0_windows_amd64.zip" -OutFile "$(Agent.TempDirectory)\telegraf\telegraf.zip" -UseBasicParsing
+       Expand-Archive -Path "$(Agent.TempDirectory)\telegraf\telegraf.zip" -DestinationPath  "$(Agent.TempDirectory)\telegraf\telegrafExtracted\"
+       Write-Host "Testing Telegraf Configuration"
+       & "$(Agent.TempDirectory)\telegraf\telegrafExtracted\telegraf\telegraf.exe" -config $(Build.SourcesDirectory)\Monitoring_Stack\Telegraf\telegraf.conf -test
+      displayName: 'Verify Telegraf Config File'
+
+    - powershell: |
+       New-Item -Path "$(Build.ArtifactStagingDirectory)\" -Name "telegraf" -ItemType Directory
+       Copy-Item $(Build.SourcesDirectory)\Monitoring_Stack\Telegraf\* $(Build.ArtifactStagingDirectory)\telegraf\ -Recurse
+      displayName: 'Copy Telegraf Config File to Artifacts Directory'
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)\telegraf\'
+        artifact: TelegrafPackage
+
+- stage: Deploy
+  dependsOn: Build
+  jobs: 
+  - deployment: Deploy
+    displayName: Deploy Telegraf Config File Job
+    pool:
+      name: LocalTest
+    environment: Live
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - powershell: | 
+             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+             $tags = @("deploy", "dev", "telegraf", "started")
+             $body = @{
+                 "what" = "Telegraf - Deploy"
+                 "tags" = $tags
+                 "data" = "Started - Deploy of master branch"
+               } | ConvertTo-Json
+             $Header = @{"Authorization" = "$(GRAFANA_BEARER_TOKEN)"
+              "Accept" = "application/json"
+              "Content-Type" = "application/json"
+             }
+             Invoke-RestMethod -Method POST -Header $Header -Uri "$(GRAFANA_BASE_URL)/api/annotations/graphite" -Body $body
+            displayName: 'Post Grafana Annotation of Start Deploy'
+            env:
+              GRAFANA_BASE_URL: $(GRAFANA_BASE_URL) # Maps the secret variable $(token)
+              GRAFANA_BEARER_TOKEN: $(GRAFANA_BEARER_TOKEN)
+
+          - powershell: | 
+             $serviceCheck = Get-Service -Name "telegraf" 
+             if ($null -eq $serviceCheck) {
+                 Write-Host "Telegraf service not installed, installing now..."
+                 New-Item -Path "$(Build.SourcesDirectory)\telegraf" -ItemType Directory -Force
+                 Invoke-WebRequest "https://dl.influxdata.com/telegraf/releases/telegraf-1.13.0_windows_amd64.zip" -OutFile "$(Build.SourcesDirectory)\telegraf\telegraf.zip" -UseBasicParsing
+                 Expand-Archive -Path "$(Build.SourcesDirectory)\telegraf\telegraf.zip" -DestinationPath  "$(Build.SourcesDirectory)\telegraf\telegrafExtracted\"
+             
+                 $serverListToInstalOn = @(
+                     'localhost'
+                 )
+             
+                 $serverListToInstalOn | % {
+                     Write-Host "$($_)..."
+                     Write-Host "..Create folders and copy files..."
+             
+                     $ProgDir = Get-Item -Path "C:\Program Files\telegraf"
+                     $MaintDir = Get-Item -Path "C:\DBOps"
+             
+                     if ($null -eq $ProgDir) {
+                         New-Item -Path "C:\Program Files\telegraf" -ItemType Directory -Force
+                     }
+             
+                     if ($null -eq $MaintDir) {
+                         New-Item -Path "C:\DBOps" -ItemType Directory -Force
+                     }
+             
+                     Copy-Item -Path "$(Build.SourcesDirectory)\Monitoring_Stack\telegraf\telegraf.conf" -Destination "c:\Program Files\telegraf\" -Force
+                     Copy-Item -Path "$(Build.SourcesDirectory)\telegraf\telegrafExtracted\telegraf\telegraf.exe" -Destination "c:\Program Files\telegraf\" -Force
+                     Copy-Item -Path "$(Build.SourcesDirectory)\Monitoring_Stack\telegraf\Start-Telegraf.ps1" -Destination "c:\DBops\Start-Telegraf.ps1" -Force
+             
+                     Invoke-Command -ComputerName localhost -ScriptBlock {
+                         Write-Host '..Install telegraf service...'
+                         Stop-Service -Name telegraf -ErrorAction SilentlyContinue
+                         & "c:\program files\telegraf\telegraf.exe" --service install -config "c:\program files\telegraf\telegraf.conf"
+                         Set-Service -Name "telegraf" AutomaticDelayedStart 
+                         Start-Service -Name telegraf
+                         Start-Sleep 90
+            
+                         # Make sure it starts
+                         $service = Get-Service | Where-Object { $_.Status -eq "Running" -and $_.Name -eq "telegraf" }
+                         While ($service.count -eq 0) {
+                             Start-Service -Name "telegraf"
+                             Start-Sleep 90
+                             $service = Get-Service | Where-Object { $_.Status -eq "Running" -and $_.Name -eq "telegraf" }
+                         }
+                     }
+                 }
+             }
+             
+             $job = Get-ScheduledJob -Name "Start-Telegraf"
+                     
+             if ($null -eq $job) {
+                 Write-Host 'Setup job to make sure it autostarts...'
+                 #Create job to start job on startup
+                 $trigger = New-JobTrigger -AtStartup -RandomDelay 00:00:30
+                 Register-ScheduledJob -Trigger $trigger -FilePath C:\DBOps\Start-Telegraf.ps1 -Name Start-Telegraf 
+             }
+            displayName: 'Check Installation of Telegraf Service'
+            
+          - powershell: Stop-Service telegraf
+            displayName: 'Stop Telegraf Service'
+
+          - powershell: Copy-Item $(Pipeline.Workspace)\TelegrafPackage\telegraf.conf "C:\Program Files\telegraf\telegraf.conf"
+            displayName: 'Copy Telegraf Conf to target directory'
+
+          - powershell: Copy-Item $(Pipeline.Workspace)\TelegrafPackage\DataScripts\* "C:\Program Files\telegraf\DataScripts" -Recurse -Force
+            displayName: 'Copy Powershell Telegraf Scripts to target directory'
+
+          - powershell: Start-Service telegraf
+            displayName: 'Start Telegraf Service'
+
+          - powershell: |
+             Stop-Service telegraf
+             $date = (get-date).ToShortDateString().Replace("/","")
+             Copy-Item "C:\Program Files\telegraf\BackupConfig\$date\telegraf.conf" "C:\Program Files\telegraf\telegraf.conf"
+             Start Telegraf Service
+            displayName: 'Rollback to previous Telegraf Conf file if previous step fails'
+            condition: failed()
+
+          - powershell: | 
+             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+             $tags = @("deploy", "dev", "telegraf", "finished")
+             $body = @{
+                 "what" = "Telegraf - Deploy"
+                 "tags" = $tags
+                 "data" = "Finished - Deploy of master branch"
+               } | ConvertTo-Json
+             $Header = @{"Authorization" = "$(GRAFANA_BEARER_TOKEN)"
+              "Accept" = "application/json"
+              "Content-Type" = "application/json"
+             }
+             Invoke-RestMethod -Method POST -Header $Header -Uri "$(GRAFANA_BASE_URL)/api/annotations/graphite" -Body $body
+            displayName: 'Post Grafana Annotation of Finished Deploy'
+            env:
+              GRAFANA_BASE_URL: $(GRAFANA_BASE_URL) # Maps the secret variable $(token)
+              GRAFANA_BEARER_TOKEN: $(GRAFANA_BEARER_TOKEN)

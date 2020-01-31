@@ -1,0 +1,87 @@
+name: $(Major).$(Minor).$(Patch)
+
+variables:
+  Major: 1
+  Minor: 0
+  Patch: $[counter(format('{0}.{1}', variables['Major'], variables['Minor']), 0)]
+  
+resources:
+- repo: self
+
+trigger:  
+  branches:
+    include:
+    - master
+  paths:
+    include:
+    - Monitoring_Stack/Docker/docker-compose.yml
+    - azure-pipeline-docker.yml
+
+stages:
+- stage: Build
+  displayName: Build
+  jobs:
+  - job: Build
+    displayName: Build Docker Monitoring Solution
+    pool:
+      name: LocalLinux
+    workspace:
+      clean: all 
+    steps:
+    - bash: |
+       docker-compose -f $(Build.SourcesDirectory)/Monitoring_Stack/Docker/docker-compose.yml config
+      displayName: 'Verify New Docker Compose File'
+
+    - bash: |
+       mkdir -p /home/user/Docker/BackupConfig
+       cp /home/user/Docker/docker-compose.yml /home/user/Docker/BackupConfig/docker-compose.yml
+      displayName: 'Backup Docker Compose File'
+
+    - bash: |
+       mkdir -p $(Build.ArtifactStagingDirectory)/docker
+       cp $(Build.SourcesDirectory)/Monitoring_Stack/Docker/docker-compose.yml $(Build.ArtifactStagingDirectory)/docker/docker-compose.yml
+      displayName: 'Copy Docker Components to Artifacts Directory'
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/docker/'
+        artifact: DockerPackage
+
+- stage: Deploy
+  dependsOn: Build
+  jobs: 
+  - deployment: Deploy
+    displayName: Deploy Docker Compose Job
+    pool:
+      name: LocalLinux
+    environment: Live
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - bash: |
+             cd /home/user/Docker
+            displayName: 'Change to Docker Compose Directory'
+
+          - bash: |
+             ls $AGENT_BUILDDIRECTORY/DockerPackage
+             cp $AGENT_BUILDDIRECTORY/DockerPackage/* /home/user/Docker/ -R
+            displayName: 'Copy Docker Artifacts to Docker Dir'
+
+          - bash: |
+             cd /home/user/Docker
+             docker-compose down
+            displayName: 'Stop all Docker Images'
+
+          - bash: |
+             cd /home/user/Docker
+             docker-compose up -d
+            displayName: 'Apply new Docker Compose File'
+
+          - bash: |
+             cd /home/user/Docker
+             docker-compose down
+             cp /home/user/Docker/BackupConfig/docker-compose.yml /home/user/Docker/docker-compose.yml
+             docker-compose up -d
+            displayName: 'Rollback to previous Docker Compose file if previous step fails'
+            condition: failed()

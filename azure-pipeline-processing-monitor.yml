@@ -1,0 +1,160 @@
+name: $(Major).$(Minor).$(Patch)
+
+variables:
+  Major: 1
+  Minor: 0
+  Patch: $[counter(format('{0}.{1}', variables['Major'], variables['Minor']), 0)]
+  processMonitorServiceAccount: gzw-admin
+  processMonitorTaskName: Processing Monitor
+  CLIENT: CLIENT
+  ENVIRONMENT: Local
+  LOG_FILE_PATH: C:\dev\git\env\Local\report\logs\GZW.log
+  WAIT_TIME: 60
+  SEND_EMAIL: Yes
+  ENABLE_LOGGING: Y
+  EMAIL_FROM_ADDRESS: from@sender.com
+  EMAIL_TO_ADDRESS: to@recipient.com
+  SMTP_SERVER: smtp.office365.com
+  SMTP_PORT: 587
+  SMTP_USER: smtpuser@sender.com
+  OVERNIGHT_START_TIME: 18:00
+  OVERNIGHT_FINISH_TIME: 05:00
+  LOG_DIFF_TIME_THRESHOLD: 5
+  GRAFANA_BASE_URL: http://192.168.17.95/grafana
+
+resources:
+- repo: self
+
+trigger:  
+  branches:
+    include:
+    - master
+  paths:
+    include:
+    - Processing_Monitor/*
+    - azure-pipeline-processing-monitor.yml
+
+stages:
+- stage: Build
+  displayName: Build
+  jobs:
+  - job: Build
+    displayName: Build Processing Monitor Solution
+    pool:
+      name: LocalTest
+    workspace:
+      clean: all 
+    steps:
+    - powershell: |
+       New-Item -Path "$(Build.ArtifactStagingDirectory)\" -Name "ProcessMonitor" -ItemType Directory
+       Copy-Item $(Build.SourcesDirectory)\Processing_Monitor\* $(Build.ArtifactStagingDirectory)\ProcessMonitor\ -Recurse
+      displayName: 'Copy ProcessMonitor to Artifacts Directory'
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)\ProcessMonitor\'
+        artifact: ProcessMonitorPackage
+
+- stage: Deploy
+  dependsOn: Build
+  jobs: 
+  - deployment: Deploy
+    displayName: Deploy ProcessMonitor Job
+    pool:
+      name: LocalTest
+    environment: Live
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - powershell: | 
+             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+             $tags = @("deploy", "dev", "processmonitor", "started")
+             $body = @{
+                 "what" = "Process Monitor - Deploy"
+                 "tags" = $tags
+                 "data" = "Started - Deploy of master branch"
+               } | ConvertTo-Json
+             $Header = @{"Authorization" = "$(GRAFANA_BEARER_TOKEN)"
+              "Accept" = "application/json"
+              "Content-Type" = "application/json"
+             }
+             Invoke-RestMethod -Method POST -Header $Header -Uri "$(GRAFANA_BASE_URL)/api/annotations/graphite" -Body $body
+            displayName: 'Post Grafana Annotation of Start Deploy'
+            env:
+              GRAFANA_BASE_URL: $(GRAFANA_BASE_URL) # Maps the secret variable $(token)
+              GRAFANA_BEARER_TOKEN: $(GRAFANA_BEARER_TOKEN)
+
+          - task: replacetokens@3
+            displayName: 'Replace secret tokens in **/*.properties file'
+            inputs:
+              rootDirectory: $(Pipeline.Workspace)\ProcessMonitorPackage\
+              targetFiles: '**/*.properties'
+            env:
+              ENVIRONMENT: $(ENVIRONMENT) # Maps the secret variable $(token)
+              LOG_FILE_PATH: $(LOG_FILE_PATH)
+              WAIT_TIME: $(WAIT_TIME)
+              SEND_EMAIL: $(SEND_EMAIL)
+              ENABLE_LOGGING: $(ENABLE_LOGGING) 
+              EMAIL_FROM_ADDRESS: $(EMAIL_FROM_ADDRESS)
+              EMAIL_TO_ADDRESS: $(EMAIL_TO_ADDRESS) 
+              SMTP_SERVER: $(SMTP_SERVER)
+              SMTP_PORT: $(SMTP_PORT)
+              SMTP_USER: $(SMTP_USER) 
+              OVERNIGHT_START_TIME: $(OVERNIGHT_START_TIME)
+              OVERNIGHT_FINISH_TIME: $(OVERNIGHT_FINISH_TIME)
+              LOG_DIFF_TIME_THRESHOLD: $(LOG_DIFF_TIME_THRESHOLD)
+              API_KEY: $(API_KEY) 
+              GECKO_PUSH_URL1: $(GECKO_PUSH_URL1)
+              CLIENT: $(CLIENT)
+              SMTP_PASSWORD: $(SMTP_PASSWORD)
+
+          - powershell: |
+             $ProgDir = Get-Item "C:\Program Files\telegraf"
+             $MaintDir = Get-Item "C:\DBOps"
+             if ($null -eq $ProgDir) {New-Item -Path "C:\Program Files\telegraf" -ItemType Directory -Force}
+             if ($null -eq $MaintDir){New-Item -Path "C:\DBOps" -ItemType Directory -Force}
+            displayName: 'Create Folder Structure'
+
+          - powershell: Copy-Item $(Pipeline.Workspace)\ProcessMonitorPackage\* c:\DBops -Recurse -Force
+            displayName: 'Copy files to directory'
+
+          - powershell: |
+             $TaskExists =  Get-ScheduledTask -TaskName "$(processMonitorTaskName)" -ErrorAction SilentlyContinue | out-null 
+             if ($null -eq $TaskExists){
+             $A = New-ScheduledTaskAction -Execute "Powershell.exe" -Argument '-NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -File C:\DBOps\processingMonitoring.ps1'
+             $T = New-ScheduledTaskTrigger -AtLogon
+             $P = New-ScheduledTaskPrincipal -UserID "NT AUTHORITY\SYSTEM" -RunLevel Highest
+             $S = New-ScheduledTaskSettingsSet
+             $D = New-ScheduledTask -Action $A -Principal $P -Trigger $T -Settings $S
+             Register-ScheduledTask -TaskPath "$(CLIENT)" -InputObject $D -TaskName "$(processMonitorTaskName)" 
+             }
+            displayName: 'Create Scheduled Task if required'
+            env:
+              processMonitorTaskName: $(processMonitorTaskName) # Maps the secret variable $(token)
+
+          - powershell: |
+             Get-ScheduledTask -TaskName "$(processMonitorTaskName)" | Disable-ScheduledTask
+             Get-ScheduledTask -TaskName "$(processMonitorTaskName)" | Enable-ScheduledTask
+             Get-ScheduledTask -TaskName "$(processMonitorTaskName)" | Start-ScheduledTask
+            displayName: 'Restart Scheduled Task'
+            env:
+              processMonitorTaskName: $(processMonitorTaskName) # Maps the secret variable $(token)
+
+          - powershell: | 
+             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+             $tags = @("deploy", "dev", "processmonitor", "finished")
+             $body = @{
+                 "what" = "Process Monitor - Deploy"
+                 "tags" = $tags
+                 "data" = "Finished - Deploy of master branch"
+               } | ConvertTo-Json
+             $Header = @{"Authorization" = "$(GRAFANA_BEARER_TOKEN)"
+              "Accept" = "application/json"
+              "Content-Type" = "application/json"
+             }
+             Invoke-RestMethod -Method POST -Header $Header -Uri "$(GRAFANA_BASE_URL)/api/annotations/graphite" -Body $body
+            displayName: 'Post Grafana Annotation of Finished Deploy'
+            env:
+              GRAFANA_BASE_URL: $(GRAFANA_BASE_URL) # Maps the secret variable $(token)
+              GRAFANA_BEARER_TOKEN: $(GRAFANA_BEARER_TOKEN)
