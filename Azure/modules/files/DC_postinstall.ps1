@@ -166,10 +166,11 @@ $DcPostInstall2 = @"
     Import-Module RemoteDesktop
     "RDS ServerName: `$RdsServerName" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
     "RDS Roles Started" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
-    do {
-        `$NewSession = New-RDSessionDeployment -ConnectionBroker `$RdsServerName -SessionHost `$RdsServerName -WebAccessServer `$RdsServerName
-        "RDS Session Creating" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
-        } while (`$null -eq `$NewSession)
+    
+    `$NewSession = New-RDSessionDeployment -ConnectionBroker `$RdsServerName -SessionHost `$RdsServerName -WebAccessServer `$RdsServerName
+    start-sleep -seconds 400
+    "RDS Session Creating" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
+        
     
     # Licensing Server 
     do {
