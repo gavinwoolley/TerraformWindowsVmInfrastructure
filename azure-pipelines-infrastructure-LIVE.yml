@@ -9,7 +9,7 @@ variables:
 - name: Patch
   value: $[counter(format('{0}.{1}', variables['Major'], variables['Minor']), 0)]
 - name: ClientName
-  value: CLIENT # 6 Characters Maximum
+  value: CLIENT # 6 Characters Maximum - Due to NetBios Naming Restrictions
 - name: SupplierName
   value: Supplier
 - name: Environment

@@ -141,16 +141,23 @@ $contents = @"
 $contents | Out-File -FilePath "C:\terraform\ADSetup.ps1"
 
 $DcPostInstall2 = @"
-    # Setup RDS Server Roles
+# Setup RDS Server Roles
+    do {
     `$RdsServerName = (Get-ADComputer -Filter 'Name -like "*RDS*"').DNSHostName
+    "RDS Server Name Checking" | Out-File -FilePath "C:\terraform\DCSetup.log" -Append
+    } while (`$null -eq `$RdsServerName)
+    
+    do {
     `$AppServerName = (Get-ADComputer -Filter 'Name -like "*QA-APP*" -or Name -like "*PROD-APP*"').DNSHostName
+    "APP Server Name Checking" | Out-File -FilePath "C:\terraform\DCSetup.log" -Append
+    } while (`$null -eq `$AppServerName)
 
     do {
     `$TestRdsConnection = Test-Connection -ComputerName `$RdsServerName -Count 1 -Quiet
     "Testing RDS Connection" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
     } while (`$TestRdsConnection -eq `$false)
 
-       do {
+    do {
     `$TestAppServerConnection = Test-Connection -ComputerName `$AppServerName -Count 1 -Quiet
     "Testing App Server Connection" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
     } while (`$TestAppServerConnection -eq `$false)
@@ -159,21 +166,34 @@ $DcPostInstall2 = @"
     Import-Module RemoteDesktop
     "RDS ServerName: `$RdsServerName" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
     "RDS Roles Started" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
-
-    New-RDSessionDeployment -ConnectionBroker `$RdsServerName -SessionHost `$RdsServerName -WebAccessServer `$RdsServerName
-    "RDS Session Created" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
-
-    # Licensing server 
-    Add-RDServer -Server `$AppServerName -Role RDS-LICENSING -ConnectionBroker `$RdsServerName
-    Set-RDLicenseConfiguration -LicenseServer `$AppServerName -Mode PerUser -ConnectionBroker `$RdsServerName -Force
-    "Activate RDS Server" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
-
+    do {
+        `$NewSession = New-RDSessionDeployment -ConnectionBroker `$RdsServerName -SessionHost `$RdsServerName -WebAccessServer `$RdsServerName
+        "RDS Session Creating" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
+        } while (`$null -eq `$NewSession)
+    
+    # Licensing Server 
+    do {
+        `$RdsServerRole = Get-RDServer -ConnectionBroker `$RdsServerName
+        `$LicenseServerRole = (Get-RDLicenseConfiguration -ConnectionBroker `$RdsServerName).LicenseServer
+        Add-RDServer -Server `$AppServerName -Role RDS-LICENSING -ConnectionBroker `$RdsServerName
+        "RDS Server Role" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
+        } while (`$null -eq `$RdsServerRole -and `$null -eq `$LicenseServerRole)
+    
+        do {
+        `$RdsLicenseConfigPerUser = (Get-RDLicenseConfiguration -ConnectionBroker `$RdsServerName).Mode
+        Set-RDLicenseConfiguration -LicenseServer `$AppServerName -Mode PerUser -ConnectionBroker `$RdsServerName -Force
+        "Activate RDS Server" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
+        } while (`$RdsLicenseConfigPerUser -eq "NotConfigured" )
+    
     # Activate License Server 
-    `$AppServerHostName = (Get-ADComputer -Filter 'Name -like "*QA-APP*" -or Name -like "*PROD-APP*"').Name
+    do {
+        `$AppServerHostName = (Get-ADComputer -Filter 'Name -like "*QA-APP*" -or Name -like "*PROD-APP*"').Name
+        } while (`$null -eq `$AppServerHostName)
+
     `$licenseServer = `$AppServerHostName
     `$companyInformation = @{}
     `$companyInformation.FirstName="#{SupplierName}#"
-    `$companyInformation.LastName="Software"
+    `$companyInformation.LastName="#{SupplierName}#"
     `$companyInformation.Company="#{SupplierName}#"
     `$companyInformation.CountryRegion="United Kingdom"
     "Starting license Server activation" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
@@ -196,11 +216,15 @@ $DcPostInstall2 = @"
 
         `$licServerResult.LicenseServerActivated = `$wmiClass.GetActivationStatus().ActivationStatus
         "Activation Status: `$(`$licServerResult.LicenseServerActivated) (0 = Activated, 1 = Not Activated)" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
+
+        return `$licServerResult
     }
 
-    Initialize-LicenseServer `$licenseServer `$companyInformation
-    "Finished Activation License Server" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
-
+    do {
+        `$ActivationStatus = Initialize-LicenseServer `$licenseServer `$companyInformation
+        "Activating License Server" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
+        } while (`$ActivationStatus.values -ne 0)
+    
     `$AppServerName = Get-ADComputer -Filter 'Name -like "*QA-APP*" -or Name -like "*PROD-APP*"'
     Add-ADGroupMember -Identity "Terminal Server License Servers" -Members `$(`$AppServerName.DistinguishedName)
     "Add RDS to License Group" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
@@ -215,8 +239,10 @@ $DcPostInstall2 = @"
     `$agreementNumber # AgreementNumber
     )
 
-    Invoke-WmiMethod -Namespace "root/cimv2" -Class Win32_TSLicenseKeyPack -Name InstallAgreementLicenseKeyPack -ArgumentList `$Argumentlist -ComputerName `$licenseServer
-    "Activate Licenses" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
+    do {
+        `$LicenseActivationCommand =  Invoke-WmiMethod -Namespace "root/cimv2" -Class Win32_TSLicenseKeyPack -Name InstallAgreementLicenseKeyPack -ArgumentList `$Argumentlist -ComputerName `$licenseServer
+        "Activating Licenses" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
+        } while (`$null -eq `$LicenseActivationCommand)
 
     # Create Run Once Entry on RDS Box to create the session collection
     "Create Run Once for next step" | Out-File -FilePath "C:\terraform\ADSetup.log" -Append
